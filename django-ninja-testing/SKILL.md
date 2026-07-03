@@ -273,6 +273,21 @@ FieldError: Cannot resolve keyword 'task_uuid' into field.
 
 **Root cause:** The model defines a `ForeignKey` named `task`, but code tries to filter by `task_uuid`. Django ORM uses the **field name** (`task`), not the database column name (`task_uuid`).
 
+**Sub-pattern: FK accessor `_id` suffix confusion**
+
+Django silently appends `_id` to the field name for the database column accessor:
+- Model field `user_id = ForeignKey(...)` → ORM accessor `user_id_id` (not `user_id`)
+- Model field `an = ForeignKey(LansInfo, db_column="an")` → ORM accessor `obj.an_id` returns the FK value directly as a scalar (avoids the `obj.an` relation traversal)
+
+This means code that reads `obj.user_id` may actually travers to the related object (not the scalar FK value). To get the scalar FK value, use `obj.<field_name>_id` — Django always appends `_id` in the ORM accessor regardless of `db_column`.
+
+**Test trap:** When a schema uses `from_attributes`, Ninja accesses `obj.an` which returns a `LansInfo` ORM object (not a string). To serialize the FK value as a string, use a `resolve_<field>` method:
+```python
+@staticmethod
+def resolve_an(obj):
+    return getattr(obj, "an_id", None)
+```
+
 **Fix:**
 ```python
 # WRONG
@@ -394,6 +409,128 @@ def test_endpoint_with_prefetch():
     client = _get_client()
     resp = client.get("/audit/comparison/tasks/", headers=_auth_headers(user))
     assert resp.status_code == 200
+```
+
+### Pattern 6: `filter().update()` silent no-op
+
+**Symptom:**
+An `update()` call "succeeds" but the target rows are not actually changed. No exception is raised.
+
+**Root cause:** `QuerySet.filter(...).update(...)` returns the number of affected rows, but most callers ignore it. If the filter matches zero rows (e.g., because the rows were already updated/deleted between the read and the write), the update **silently does nothing**. The caller has no way to know.
+
+**Example:**
+```python
+# WRONG — ignores return value, silent no-op
+ComparisonInconsistentRows.objects.filter(
+    id__in=row_ids
+).update(is_processed=True)
+# If row_ids are stale (already processed by another request),
+# this succeeds but marks nothing. No error reported.
+
+# CORRECT — check affected > 0
+affected = ComparisonInconsistentRows.objects.filter(
+    id__in=row_ids
+).update(is_processed=True)
+if affected == 0:
+    logger.warning("update matched 0 rows — stale row_ids?")
+```
+
+**Scope:**
+This pattern is most dangerous when:
+- `filter()` conditions reference data that could change between the read and the write
+- `row_ids` come from a previous query (read-skew)
+- There is no `transaction.atomic()` wrapping (so the read and write are not atomic)
+
+**In this codebase, the following `filter().update()` calls ignore the return value:**
+- `inconsistency_service.py`: marking `no_apply_list` rows as processed (line ~349)
+- `inconsistency_service.py`: marking reconciled `row_ids` as processed (line ~592)
+- `inconsistency_service.py`: gateway/mask/ip_subnet bulk updates (lines ~793-803)
+- `missing_service.py`: `LansIp` per-IP updates (line ~849)
+- `missing_service.py`: marking `ComparisonMissingRows` as processed (line ~855)
+
+The only place that DOES check `affected > 0` is `inconsistency_service.py` line ~513 for `LansInfo` updates.
+
+**Fix:** Always capture the return value of `filter().update()` and log a warning (or raise) when `affected == 0`.
+
+**Regression test:**
+```python
+def test_stale_row_ids_silent_noop():
+    """Verify that updating already-processed rows does not silently succeed."""
+    # Create a row, process it, then try to process again
+    # The second call should either be idempotent (SKIPPED) or warn in logs
+```
+
+### Pattern 7: `list` → Django `TextField` serialization trap
+
+**Symptom:**
+```
+ValueError: invalid IP address: "['44.61.216.113'"
+```
+Or any downstream parse error where a value has unexpected brackets/quotes.
+
+**Root cause:** Assigning a Python `list` to a Django model's `TextField` (or any `CharField`/`TextField`) causes Django to call `str(value)` automatically, which for a list produces Python **repr** format — complete with brackets, quotes, and escaped characters:
+
+```python
+ip_list = ["44.61.216.113", "44.61.216.114"]
+obj = ComparisonInconsistentRows(
+    value_from_source=ip_list,  # Django stores str(ip_list)
+)
+# DB stores: "['44.61.216.113', '44.61.216.114']"
+```
+
+When another function reads this value and tries to parse it (e.g., `normalize_ips()` which splits on semicolons), it gets fragments with embedded brackets and quotes. The first token becomes `"['44.61.216.113'"` — which fails validation.
+
+**Fix — serialize explicitly before storing:**
+```python
+import json
+
+# CORRECT: serialize to JSON array string
+obj = ComparisonInconsistentRows(
+    value_from_source=json.dumps(excel_ips, ensure_ascii=False),
+    value_from_db=json.dumps(db_ip_list, ensure_ascii=False),
+)
+```
+
+**Fix — deserialize defensively in the reader:**
+When reading `TextField` values that might contain serialized lists, handle all historical formats:
+```python
+def _parse_ip_list(value: str) -> list[str]:
+    """Parse IP list from DB, supporting JSON array, Python repr, and ;-delimited."""
+    if not isinstance(value, str):
+        return []
+    raw = value.strip()
+    if not raw:
+        return []
+
+    # Try JSON array first
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(ip).strip() for ip in parsed]
+        except json.JSONDecodeError:
+            pass
+        # Fallback: ast.literal_eval for Python repr (legacy data)
+        try:
+            parsed = ast.literal_eval(raw)
+            if isinstance(parsed, list):
+                return [str(ip).strip() for ip in parsed]
+        except (ValueError, SyntaxError):
+            pass
+
+    # Fallback: semicolon/comma delimited
+    return [ip.strip(" '\"") for ip in re.split(r"[;,；，\s]+", raw) if ip.strip(" '\"")]
+```
+
+**Test trap:** This bug is invisible in unit tests if the test creates model instances via `ComparisonInconsistentRows(...)` and reads back the value from the same Python object. The repr conversion only happens when the value passes through the **database** (save + refresh from DB). To catch this, write integration tests that go through the full save-and-reload cycle:
+```python
+def test_list_stored_in_textfield_serialized_as_json():
+    row = ComparisonInconsistentRows.objects.create(
+        value_from_source=["1.1.1.1", "2.2.2.2"]
+    )
+    # Refresh from DB to trigger repr conversion
+    row.refresh_from_db()
+    assert row.value_from_source == '["1.1.1.1", "2.2.2.2"]'
 ```
 
 ---
