@@ -13,38 +13,39 @@ description: Write and troubleshoot Django Ninja API endpoint tests. Use when th
 
 ```python
 # tests/sheetScript/test_my_api.py
-import os, sys
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "SheetManage.settings")
-sys.path.insert(0, ".")
-import django; django.setup()
+import pytest
+
+pytestmark = pytest.mark.django_db
 
 from ninja.testing import TestClient
-from SheetManage.api import api as main_api
+from sheetScript.api.bearer import get_jwt_token
+from sheetScript.models import NocAcc
 
-# CRITICAL: TestClient is a process-wide singleton.
-# Creating it more than once raises
-#   ninja.errors.ConfigError: Looks like you created multiple NinjaAPIs or TestClients
-
-_client: TestClient | None = None
 
 def _get_client() -> TestClient:
-    global _client
-    if _client is None:
-        _client = TestClient(main_api)
-    return _client
+    from .test_client import get_test_client
+    return get_test_client()
 
 
-def test_my_endpoint_success():
+def test_my_endpoint_success(test_user, auth_headers):
     client = _get_client()
-    resp = client.get("/my-app/my-endpoint", headers=_auth_headers(user))
+    resp = client.get("/my-app/my-endpoint", headers=auth_headers)
     assert resp.status_code == 200
     assert resp.json()["info"] == "Success"
+
 
 def test_my_endpoint_no_auth_401():
     client = _get_client()
     resp = client.get("/my-app/my-endpoint")
     assert resp.status_code == 401
 ```
+
+Note:
+- `pytestmark = pytest.mark.django_db` is required for any test that touches the database
+- `test_user` and `auth_headers` are session-scoped fixtures from `conftest.py`
+- NEVER call `django.setup()` or set `DJANGO_SETTINGS_MODULE` manually — pytest-django handles this
+- NEVER create `TestClient(router)` directly; always use `get_test_client()` from `test_client.py`
+- DB cleanup is handled automatically by pytest-django transaction rollback — do NOT add manual `.delete()` calls in `finally:` blocks
 
 ## TestClient Singleton Rule
 
@@ -126,28 +127,13 @@ client.get("/tasks")  # fragile
 ## Testing authenticated endpoints
 
 ```python
-import jwt, time
-from django.conf import settings
-
-def _make_jwt(user: NocAcc) -> str:
-    payload = {
-        "acc": user.sps_acc,
-        "area": user.area,
-        "username": user.username,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 3600 * 24,
-    }
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
-
-def _auth_headers(user: NocAcc) -> dict[str, str]:
-    return {"Authorization": f"Bearer {_make_jwt(user)}"}
-
-def test_auth_endpoint():
-    user = _ensure_test_user()
+def test_auth_endpoint(auth_headers):
     client = _get_client()
-    resp = client.get("/protected/endpoint", headers=_auth_headers(user))
+    resp = client.get("/protected/endpoint", headers=auth_headers)
     assert resp.status_code == 200
 ```
+
+The `auth_headers` fixture (from `conftest.py`) provides a valid JWT for the admin test user. If you need a regular user, use `NocAcc.objects.get(sps_acc="test_regular_user")` (future).
 
 ## Testing non-200 status codes
 
@@ -176,33 +162,95 @@ def test_file_upload():
     assert resp.status_code == 201
 ```
 
-## Running tests: always use pytest
+## Seeding legacy dirty rows: raw SQL insert fixture
+
+Model-level validation (Manager/QuerySet/save overrides, custom field `get_prep_value`) **rejects or silently normalizes** rows that still exist in production from before validation was added. Such legacy dirty rows cannot be created through the ORM:
+
+- 「占用无 an」rows — strict-mode model validation rejects them, `objects.create()` raises
+- Host-bits-nonzero subnets (`10.0.0.5/24`) — `CidrField.get_prep_value` normalizes to `10.0.0.0/24`, so the dirty value never reaches the DB via the ORM
+
+**Use the shared conftest fixture `insert_raw_lans_ip`** (`tests/sheetScript/conftest.py`) instead of copying raw SQL into each test file. It inserts via `connection.cursor()` (bypassing model validation) and accepts keyword params including `state`, `gateway`, and `an`:
+
+```python
+@pytest.mark.integration
+def test_contains_finds_dirty_row(self, insert_raw_lans_ip):
+    insert_raw_lans_ip(
+        ip_id=990002006,
+        bas_ip="10.99.60.9",
+        ip_subnet="10.99.85.5/24",  # host bits nonzero — stays dirty
+        ip="10.99.85.10",
+        # state="空闲" (default), gateway="10.88.0.1" (default), an=None (default)
+    )
+    assert LansIp.objects.filter(ip_subnet__contains="10.99.85.5/24").exists()
+```
+
+Rules:
+- Raw inserts still run inside the pytest-django per-test transaction and roll back — no manual cleanup
+- Mark these tests `@pytest.mark.integration` (real DB row, per AGENTS.md §6.1 white-list)
+- Do NOT hand-roll per-file raw SQL — request the shared fixture so bypass points stay in one place
+
+## Compile-time SQL parameter assertions (no DB)
+
+When the question is "does field X / lookup Y normalize its RHS before hitting the DB", assert on **compiled SQL params** rather than on query results. `qs.query.sql_with_params()` returns `(sql_string, params_tuple)` at compile time without touching the database — no `django_db` mark, no seeded rows:
+
+```python
+def test_pattern_lookup_params_stay_raw():
+    # Pattern lookups (contains/icontains/startswith/endswith) are
+    # PatternLookup(prepare_rhs=False): the RHS passes through RAW
+    cases = {
+        "contains": ("10.0.0.5/24", "%10.0.0.5/24%"),
+        "startswith": ("10.0.0.5/2", "10.0.0.5/2%"),
+    }
+    for lookup, (value, expected) in cases.items():
+        _, params = LansIp.objects.filter(
+            **{f"ip_subnet__{lookup}": value}
+        ).query.sql_with_params()
+        assert params[0] == expected, lookup
+
+    # Control group: exact / in DO go through get_prep_value normalization
+    _, params = LansIp.objects.filter(ip_subnet="10.0.0.5/24").query.sql_with_params()
+    assert params[0] == "10.0.0.0/24"
+```
+
+Why not the alternatives:
+- `str(qs.query)` is unreliable — params may be inlined or quoted differently and are not stable for assertions (this approach failed in practice before switching to `sql_with_params()`)
+- DB-level assertions (seed a row, filter, check hit) require real data and conflate "param value" with "matching semantics"
+
+Use this to lock ORM semantics (field prep, lookup classes) into regression tests, and to **verify ORM claims by compiling SQL before accepting review findings** about normalization behavior.
+
+## Running tests: MUST use pytest
+
+**所有测试必须通过 pytest 运行，禁止直接 `python test_xxx.py`。**
 
 ```bash
-# CORRECT — test isolation, full failure report
+# 正确 — 事务隔离，自动回滚，完整报告
 python -m pytest tests/sheetScript/test_my_api.py
 
-# WRONG — fragile, misleading output
+# 错误 — 无事务保护，数据泄露，错误信息被吞
 python tests/sheetScript/test_my_api.py
 ```
 
-### Why `python test.py` is unreliable
+### 为什么禁止直接运行
 
-| Problem | Consequence |
-|---------|-------------|
-| Tests run sequentially in one block | First unhandled exception crashes all remaining tests — later tests never execute |
-| No test isolation | State from one test contaminates the next |
-| Manual `_assert()` helpers swallow failures | Print "FAIL" but don't propagate, exit code looks successful |
-| Piped through `findstr`/`grep` | Exception tracebacks hidden; partial output looks like full success |
-| Manual Django setup (`django.setup()`) | Duplicates or conflicts with pytest-django's own setup |
+| 问题 | 后果 |
+|------|------|
+| 没有事务回滚 | 测试数据泄漏到数据库，影响后续运行 |
+| 没有测试隔离 | 一个测试的状态污染下一个测试 |
+| 手动 `_assert()` 吞错误 | 打印 "FAIL" 但不传播，退出码始终为 0 |
+| 手动 `django.setup()` | 与 pytest-django 的自动初始化冲突 |
+| 异常导致后续测试跳过 | 第一个断言失败后所有剩余测试不执行 |
 
-With `python -m pytest`:
-- Each test runs independently — one failure never blocks others
-- Complete report: `X passed, Y failed` with full tracebacks
-- pytest-django handles `DJANGO_SETTINGS_MODULE` and `django.setup()` automatically
-- Standard exit codes: non-zero on any failure (CI-friendly)
+使用 `python -m pytest`：
 
-> **When writing new test files**, use pytest-compatible patterns (plain functions, `pytest` fixtures, `assert` statements). Avoid `if __name__ == "__main__"` dispatch blocks for real test suites — they're only useful for one-off debugging scripts.
+- **事务回滚**：每个测试在独立事务中运行，结束后自动 ROLLBACK
+- **测试隔离**：一个测试的失败不影响其他测试
+- **完整报告**：`X passed, Y failed` + 完整的 traceback
+- **自动初始化**：pytest-django 自动设置 `DJANGO_SETTINGS_MODULE` 和 Django 环境
+- **CI 兼容**：失败时退出码非 0
+
+> **所有测试文件必须是 pytest 风格**：使用纯函数、`pytest` fixture、`assert` 语句。禁止使用 `if __name__ == "__main__"` 作为测试入口。禁止在测试文件中手动调用 `django.setup()` 或设置 `DJANGO_SETTINGS_MODULE`。
+>
+> 测试数据的清理由 pytest-django 的事务回滚自动处理，不要手动添加 `.delete()` 清理代码。
 
 ## Common pitfalls
 
@@ -213,8 +261,10 @@ With `python -m pytest`:
 | Sub-router paths without prefix | 404 for paths that work in browser | Use `TestClient(main_api)` with full path |
 | Missing Content-Type for uploads | 415 Unsupported Media Type | Use `format="multipart"` as kwarg, not header |
 | Auth headers not passed | 401 on every request | Verify `Authorization: Bearer <token>` header set |
-| Test DB not isolated | Test data leaks between runs | Wrap in `transaction.atomic()` or clean up in `finally` |
+| Test DB not isolated | Test data leaks between runs | Use `pytest.mark.django_db` — pytest-django automaically rolls back each test |
 | Pytest fixture scope="function" | ConfigError because fixture re-created per test | Use `scope="session"` or `scope="module"` |
+| Seeding legacy dirty rows via `objects.create()` | "occupied without an" raises validation; dirty subnet silently normalized | Use shared conftest fixture `insert_raw_lans_ip` (raw SQL) + `@pytest.mark.integration` |
+| Asserting query params via `str(qs.query)` | Params inlined/unstable, assertions mislead | Use `qs.query.sql_with_params()` and assert on the params tuple |
 
 ---
 
@@ -272,21 +322,6 @@ FieldError: Cannot resolve keyword 'task_uuid' into field.
 ```
 
 **Root cause:** The model defines a `ForeignKey` named `task`, but code tries to filter by `task_uuid`. Django ORM uses the **field name** (`task`), not the database column name (`task_uuid`).
-
-**Sub-pattern: FK accessor `_id` suffix confusion**
-
-Django silently appends `_id` to the field name for the database column accessor:
-- Model field `user_id = ForeignKey(...)` → ORM accessor `user_id_id` (not `user_id`)
-- Model field `an = ForeignKey(LansInfo, db_column="an")` → ORM accessor `obj.an_id` returns the FK value directly as a scalar (avoids the `obj.an` relation traversal)
-
-This means code that reads `obj.user_id` may actually travers to the related object (not the scalar FK value). To get the scalar FK value, use `obj.<field_name>_id` — Django always appends `_id` in the ORM accessor regardless of `db_column`.
-
-**Test trap:** When a schema uses `from_attributes`, Ninja accesses `obj.an` which returns a `LansInfo` ORM object (not a string). To serialize the FK value as a string, use a `resolve_<field>` method:
-```python
-@staticmethod
-def resolve_an(obj):
-    return getattr(obj, "an_id", None)
-```
 
 **Fix:**
 ```python
@@ -411,128 +446,6 @@ def test_endpoint_with_prefetch():
     assert resp.status_code == 200
 ```
 
-### Pattern 6: `filter().update()` silent no-op
-
-**Symptom:**
-An `update()` call "succeeds" but the target rows are not actually changed. No exception is raised.
-
-**Root cause:** `QuerySet.filter(...).update(...)` returns the number of affected rows, but most callers ignore it. If the filter matches zero rows (e.g., because the rows were already updated/deleted between the read and the write), the update **silently does nothing**. The caller has no way to know.
-
-**Example:**
-```python
-# WRONG — ignores return value, silent no-op
-ComparisonInconsistentRows.objects.filter(
-    id__in=row_ids
-).update(is_processed=True)
-# If row_ids are stale (already processed by another request),
-# this succeeds but marks nothing. No error reported.
-
-# CORRECT — check affected > 0
-affected = ComparisonInconsistentRows.objects.filter(
-    id__in=row_ids
-).update(is_processed=True)
-if affected == 0:
-    logger.warning("update matched 0 rows — stale row_ids?")
-```
-
-**Scope:**
-This pattern is most dangerous when:
-- `filter()` conditions reference data that could change between the read and the write
-- `row_ids` come from a previous query (read-skew)
-- There is no `transaction.atomic()` wrapping (so the read and write are not atomic)
-
-**In this codebase, the following `filter().update()` calls ignore the return value:**
-- `inconsistency_service.py`: marking `no_apply_list` rows as processed (line ~349)
-- `inconsistency_service.py`: marking reconciled `row_ids` as processed (line ~592)
-- `inconsistency_service.py`: gateway/mask/ip_subnet bulk updates (lines ~793-803)
-- `missing_service.py`: `LansIp` per-IP updates (line ~849)
-- `missing_service.py`: marking `ComparisonMissingRows` as processed (line ~855)
-
-The only place that DOES check `affected > 0` is `inconsistency_service.py` line ~513 for `LansInfo` updates.
-
-**Fix:** Always capture the return value of `filter().update()` and log a warning (or raise) when `affected == 0`.
-
-**Regression test:**
-```python
-def test_stale_row_ids_silent_noop():
-    """Verify that updating already-processed rows does not silently succeed."""
-    # Create a row, process it, then try to process again
-    # The second call should either be idempotent (SKIPPED) or warn in logs
-```
-
-### Pattern 7: `list` → Django `TextField` serialization trap
-
-**Symptom:**
-```
-ValueError: invalid IP address: "['44.61.216.113'"
-```
-Or any downstream parse error where a value has unexpected brackets/quotes.
-
-**Root cause:** Assigning a Python `list` to a Django model's `TextField` (or any `CharField`/`TextField`) causes Django to call `str(value)` automatically, which for a list produces Python **repr** format — complete with brackets, quotes, and escaped characters:
-
-```python
-ip_list = ["44.61.216.113", "44.61.216.114"]
-obj = ComparisonInconsistentRows(
-    value_from_source=ip_list,  # Django stores str(ip_list)
-)
-# DB stores: "['44.61.216.113', '44.61.216.114']"
-```
-
-When another function reads this value and tries to parse it (e.g., `normalize_ips()` which splits on semicolons), it gets fragments with embedded brackets and quotes. The first token becomes `"['44.61.216.113'"` — which fails validation.
-
-**Fix — serialize explicitly before storing:**
-```python
-import json
-
-# CORRECT: serialize to JSON array string
-obj = ComparisonInconsistentRows(
-    value_from_source=json.dumps(excel_ips, ensure_ascii=False),
-    value_from_db=json.dumps(db_ip_list, ensure_ascii=False),
-)
-```
-
-**Fix — deserialize defensively in the reader:**
-When reading `TextField` values that might contain serialized lists, handle all historical formats:
-```python
-def _parse_ip_list(value: str) -> list[str]:
-    """Parse IP list from DB, supporting JSON array, Python repr, and ;-delimited."""
-    if not isinstance(value, str):
-        return []
-    raw = value.strip()
-    if not raw:
-        return []
-
-    # Try JSON array first
-    if raw.startswith("[") and raw.endswith("]"):
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                return [str(ip).strip() for ip in parsed]
-        except json.JSONDecodeError:
-            pass
-        # Fallback: ast.literal_eval for Python repr (legacy data)
-        try:
-            parsed = ast.literal_eval(raw)
-            if isinstance(parsed, list):
-                return [str(ip).strip() for ip in parsed]
-        except (ValueError, SyntaxError):
-            pass
-
-    # Fallback: semicolon/comma delimited
-    return [ip.strip(" '\"") for ip in re.split(r"[;,；，\s]+", raw) if ip.strip(" '\"")]
-```
-
-**Test trap:** This bug is invisible in unit tests if the test creates model instances via `ComparisonInconsistentRows(...)` and reads back the value from the same Python object. The repr conversion only happens when the value passes through the **database** (save + refresh from DB). To catch this, write integration tests that go through the full save-and-reload cycle:
-```python
-def test_list_stored_in_textfield_serialized_as_json():
-    row = ComparisonInconsistentRows.objects.create(
-        value_from_source=["1.1.1.1", "2.2.2.2"]
-    )
-    # Refresh from DB to trigger repr conversion
-    row.refresh_from_db()
-    assert row.value_from_source == '["1.1.1.1", "2.2.2.2"]'
-```
-
 ---
 
 ## Exception Handler Chain Validation
@@ -602,7 +515,7 @@ Label each gap:
 
 ### Step 4: Implement
 
-Generate tests following the patterns below. Reference `tests/sheetScript/test_check_lans.py` for style.
+Generate tests following the patterns below. Reference `tests/sheetScript/test_lans_api.py` or `tests/sheetScript/test_audit_api.py` for style.
 
 ### Step 5: Verify
 
@@ -615,43 +528,49 @@ Run `python -m pytest` and confirm all new tests pass.
 ### Structure (Arrange-Act-Assert)
 
 ```python
-# Example test structure based on existing patterns
 import pytest
-from django.test import TestCase
+
+pytestmark = pytest.mark.django_db
+
 from sheetScript.services.item_service import ItemService, ItemNotFoundError
 
-class TestItemService(TestCase):
-    def setUp(self):
-        self.service = ItemService()
-        # Setup test data
-        
-    def test_get_item_success(self):
+
+class TestItemService:
+    """Service layer tests using pytest style."""
+
+    def test_get_item_success(self, test_user):
         """Test successful item retrieval."""
         # Arrange
+        service = ItemService(user=test_user)
         item = Item.objects.create(name="Test Item")
-        
+
         # Act
-        result = self.service.get_item(item.id)
-        
+        result = service.get_item(item.id)
+
         # Assert
-        self.assertEqual(result.id, item.id)
-        self.assertEqual(result.name, "Test Item")
-        
-    def test_get_item_not_found(self):
+        assert result.id == item.id
+        assert result.name == "Test Item"
+
+    def test_get_item_not_found(self, test_user):
         """Test item not found raises exception."""
-        # Act & Assert
-        with self.assertRaises(ItemNotFoundError):
-            self.service.get_item(999)  # Non-existent ID
-            
-    def test_create_item_with_valid_data(self):
+        service = ItemService(user=test_user)
+        with pytest.raises(ItemNotFoundError):
+            service.get_item(999)  # Non-existent ID
+
+    def test_create_item_with_valid_data(self, test_user):
         """Test item creation with valid data."""
-        # Act
-        item_id = self.service.create_item(name="New Item", category="Test")
-        
-        # Assert
-        self.assertIsInstance(item_id, int)
-        self.assertTrue(Item.objects.filter(id=item_id).exists())
+        service = ItemService(user=test_user)
+        item_id = service.create_item(name="New Item", category="Test")
+
+        assert isinstance(item_id, int)
+        assert Item.objects.filter(id=item_id).exists()
 ```
+
+Note:
+- Use `pytest.raises(...)` instead of `self.assertRaises(...)`
+- Use `assert` instead of `self.assertEqual(...)`
+- Use `test_user` fixture for authenticated service instances
+- Service tests that mock the DB layer can omit `pytestmark`
 
 ### Requirements
 
@@ -663,7 +582,7 @@ class TestItemService(TestCase):
 
 ### Scenario: Testing a new service method
 
-1. Reference `test_check_lans.py` patterns
+1. Reference `test_lans_api.py` or `test_audit_service.py` patterns
 2. Test success cases with valid data
 3. Test error cases with invalid data
 4. Test exception propagation
